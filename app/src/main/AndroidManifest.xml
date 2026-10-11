@@ -14,7 +14,8 @@
     <application
         android:allowBackup="true"
         android:label="随机弹图器"
-        android:theme="@android:style/Theme.Material.NoActionBar">
+        android:theme="@style/Theme.AppCompat.NoActionBar"
+
 
         <activity
             android:name=".MainActivity"

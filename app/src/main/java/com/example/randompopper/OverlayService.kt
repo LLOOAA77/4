@@ -181,21 +181,13 @@ class OverlayService : Service() {
             }
             vv.setOnErrorListener { _, _, _ -> true }
             view = vv
-        } else {
-            val iv = ImageView(this)
-            iv.scaleType = ImageView.ScaleType.CENTER_CROP
-            Thread {
-                try {
-                    val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
-                    val bmp = contentResolver.openInputStream(Uri.parse(a.uri))?.use {
-                        BitmapFactory.decodeStream(it, null, opts)
-                    }
-                    if (bmp != null) {
-                        handler.post { iv.setImageBitmap(bmp) }
-                    }
-                } catch (_: Exception) {}
-            }.start()
-            view = iv
+            } else {
+    val iv = ImageView(this)
+    iv.scaleType = ImageView.ScaleType.CENTER_CROP
+    Glide.with(this)
+        .load(Uri.parse(a.uri))
+        .into(iv)
+    view = iv
         }
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)

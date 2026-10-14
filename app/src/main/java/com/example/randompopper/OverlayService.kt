@@ -1,3 +1,4 @@
+import com.bumptech.glide.Glide
 package com.example.randompopper
 
 import android.app.*

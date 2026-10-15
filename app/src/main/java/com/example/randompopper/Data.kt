@@ -12,6 +12,7 @@ data class PopItem(
     val uri: String,
     val name: String,
     val isVideo: Boolean,
+    val isAudio: Boolean,
     val width: Int,
     val height: Int,
     val durationMs: Long
@@ -25,6 +26,7 @@ object AssetStore {
     fun buildItem(ctx: Context, uri: Uri): PopItem? {
         val mime = try { ctx.contentResolver.getType(uri) } catch (_: Exception) { null } ?: return null
         val isVideo = mime.startsWith("video/")
+        val isAudio = mime.startsWith("audio/")
 
         var w = 16
         var h = 9
@@ -44,7 +46,7 @@ object AssetStore {
             } finally {
                 try { mmr.release() } catch (_: Exception) {}
             }
-        } else {
+        } else if (!isAudio) {
             val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             try {
                 ctx.contentResolver.openInputStream(uri)?.use {
@@ -59,6 +61,7 @@ object AssetStore {
             uri = uri.toString(),
             name = queryName(ctx, uri),
             isVideo = isVideo,
+            isAudio = isAudio,
             width = w,
             height = h,
             durationMs = duration
@@ -89,6 +92,7 @@ object AssetStore {
                     uri = uri,
                     name = o.optString("name", "media"),
                     isVideo = o.optBoolean("isVideo", false),
+                    isAudio = o.optBoolean("isAudio", false),
                     width = o.optInt("w", 16),
                     height = o.optInt("h", 9),
                     durationMs = o.optLong("dur", 0L)
@@ -104,6 +108,7 @@ object AssetStore {
                 put("uri", a.uri)
                 put("name", a.name)
                 put("isVideo", a.isVideo)
+                put("isAudio", a.isAudio)
                 put("w", a.width)
                 put("h", a.height)
                 put("dur", a.durationMs)

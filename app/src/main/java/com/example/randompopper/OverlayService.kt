@@ -36,7 +36,7 @@ class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private val handler = Handler(Looper.getMainLooper())
     private val activeViews = mutableListOf<View>()
-    private val backgroundViews = mutableListOf<View>() // 专门存放背景图，方便清理
+    private val backgroundViews = mutableListOf<View>()
     private val prefs by lazy { getSharedPreferences("popper_settings", Context.MODE_PRIVATE) }
 
     // 当前爆发状态
@@ -46,7 +46,22 @@ class OverlayService : Service() {
 
     private val MAX_VIEWS = 20 // 屏幕最多20张照片
 
-    private val loop = object : Runnable {
+    // ✅ 常规随机弹出循环（每 0.3 ~ 5 秒弹出一张，爆发时暂停）
+    private val normalLoop = object : Runnable {
+        override fun run() {
+            if (!isRunning) return
+            val gap = Random.nextLong(300L, 5000L)
+            handler.postDelayed({
+                if (isRunning && !isBursting) { // ✅ 改动1：爆发时跳过常规弹出
+                    try { spawnOne() } catch (e: Exception) { Log.e("Popper", "normal spawn", e) }
+                }
+                handler.postDelayed(this, gap)
+            }, gap)
+        }
+    }
+
+    // 爆发模式循环（每 30 秒触发一次爆发）
+    private val burstLoop = object : Runnable {
         override fun run() {
             if (!isRunning) return
             val gap = prefs.getInt("burst_interval", 30).toLong() * 1000L
@@ -80,7 +95,8 @@ class OverlayService : Service() {
 
     override fun onDestroy() {
         isRunning = false
-        handler.removeCallbacks(loop)
+        handler.removeCallbacks(normalLoop)
+        handler.removeCallbacks(burstLoop)
         stopAudio()
         removeAllViews()
         super.onDestroy()
@@ -90,13 +106,19 @@ class OverlayService : Service() {
         if (isRunning) return
         isRunning = true
         startForegroundCompat()
+        
+        // 启动常规随机弹出
+        handler.post(normalLoop)
+        
+        // 启动爆发循环，并立即触发一次爆发
+        handler.postDelayed(burstLoop, prefs.getInt("burst_interval", 30).toLong() * 1000L)
         startBurst()
-        handler.postDelayed(loop, prefs.getInt("burst_interval", 30).toLong() * 1000L)
     }
 
     private fun stopPopping() {
         isRunning = false
-        handler.removeCallbacks(loop)
+        handler.removeCallbacks(normalLoop)
+        handler.removeCallbacks(burstLoop)
         stopAudio()
         removeAllViews()
         stopForegroundCompat()
@@ -113,10 +135,10 @@ class OverlayService : Service() {
         Log.d("Popper", "开始爆发弹窗！")
         val count = prefs.getInt("burst_count", 15)
 
-        // 1. 添加右上角强制结束按钮（修复：现在真正显示出来了）
+        // 1. 添加右上角强制结束按钮
         addForceStopView()
 
-        // 2. 添加背景图（从图片/视频素材中随机选一张）
+        // 2. 添加背景图
         val allAssets = AssetStore.load(this)
         val mediaAssets = allAssets.filter { !it.isAudio }
         if (mediaAssets.isNotEmpty()) {
@@ -124,19 +146,19 @@ class OverlayService : Service() {
             addBackgroundView(bgAsset)
         }
 
-        // 3. 播放音频（从音频素材中随机选一个）
+        // 3. 播放音频
         val audioAssets = allAssets.filter { it.isAudio }
         if (audioAssets.isNotEmpty()) {
             playRandomAudio(audioAssets)
         }
 
-        // 4. 弹出照片
+        // 4. 弹出照片（爆发核心）
         for (i in 0 until count) {
             handler.postDelayed({
                 if (isRunning && isBursting) {
                     try { spawnOne() } catch (e: Exception) { Log.e("Popper", "burst spawn", e) }
                 }
-            }, i * 30L)
+            }, i * 30L) // 每张间隔 30 毫秒
         }
 
         // 5. 检查爆发是否结束
@@ -150,8 +172,8 @@ class OverlayService : Service() {
     private fun endBurst() {
         isBursting = false
         stopAudio()
-        removeBackgroundView() // 清理背景图
-        removeForceStopView()  // 清理长按按钮
+        removeBackgroundView()
+        removeForceStopView()
         Log.d("Popper", "爆发结束")
     }
 
@@ -163,6 +185,7 @@ class OverlayService : Service() {
 
         val iv = ImageView(this)
         iv.scaleType = ImageView.ScaleType.CENTER_CROP
+        iv.alpha = 1f // ✅ 改动2：背景完全不透明 (100%)
         Glide.with(this).load(Uri.parse(a.uri)).into(iv)
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -183,13 +206,12 @@ class OverlayService : Service() {
 
         try { 
             wm.addView(iv, lp)
-            backgroundViews.add(iv) // 修复：记录到列表里
+            backgroundViews.add(iv) 
         } catch (e: Exception) { 
             Log.e("Popper", "addBackground failed", e) 
         }
     }
 
-    // 移除背景
     private fun removeBackgroundView() {
         val copy = ArrayList(backgroundViews)
         backgroundViews.clear()
@@ -198,18 +220,18 @@ class OverlayService : Service() {
         }
     }
 
-    // 右上角强制结束按钮（修复：现在能真正显示并响应长按）
+    // 右上角强制结束按钮
     private var forceStopView: View? = null
 
     private fun addForceStopView() {
         if (forceStopView != null) return
         val size = (resources.displayMetrics.density * 60).toInt()
         val iv = ImageView(this).apply {
-            setBackgroundColor(0x33FF0000) // 半透明红色，方便定位
+            setBackgroundColor(0x33FF0000) // 半透明红色
             setOnLongClickListener {
                 if (isBursting) {
                     endBurst()
-                    removeAllViews() // 清空所有照片和背景
+                    removeAllViews() 
                 }
                 true
             }
@@ -252,7 +274,6 @@ class OverlayService : Service() {
             mp.setDataSource(this, Uri.parse(a.uri))
             mp.isLooping = false
             mp.setOnCompletionListener {
-                // 播放完成后，自动随机播放另一个
                 if (isBursting) {
                     playRandomAudio(audioAssets)
                 }
@@ -285,13 +306,12 @@ class OverlayService : Service() {
     }
 
     private fun spawnOne() {
-        if (!isRunning || !isBursting) return
+        if (!isRunning) return
         
         val allAssets = AssetStore.load(this)
         val mediaAssets = allAssets.filter { !it.isAudio }
         if (mediaAssets.isEmpty()) return
 
-        // 限制屏幕上的窗口总数 (最多20张)
         if (activeViews.size >= MAX_VIEWS) {
             val oldest = activeViews.removeAt(0)
             try { wm.removeView(oldest) } catch (_: Exception) {}
@@ -351,12 +371,12 @@ class OverlayService : Service() {
 
         view.animate().scaleX(1f).scaleY(1f).setDuration(350).start()
 
-        // 点击事件：50% 消失，50% 消失并弹 3 张
+        // 点击事件
         view.setOnClickListener {
             activeViews.remove(view)
             try { videoView?.stopPlayback(); wm.removeView(view) } catch (_: Exception) {}
             if (Random.nextBoolean()) {
-                repeat(3) { handler.postDelayed({ if (isRunning && isBursting) spawnOne() }, 50L * it) }
+                repeat(3) { handler.postDelayed({ if (isRunning) spawnOne() }, 50L * it) }
             }
         }
 
@@ -397,7 +417,7 @@ class OverlayService : Service() {
         val pi = PendingIntent.getActivity(this, 0, openIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("随机弹图器运行中")
-            .setContentText("照片/视频正在爆发弹出")
+            .setContentText("照片/视频正在随机弹出")
             .setSmallIcon(android.R.drawable.ic_menu_gallery)
             .setContentIntent(pi)
             .setOngoing(true)

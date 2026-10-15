@@ -37,14 +37,14 @@ class OverlayService : Service() {
     private val activeViews = mutableListOf<View>()
     
     // 防止手机爆满卡死，设置屏幕上最多存在的图片数量
-    private val MAX_VIEWS = 100
+    private val MAX_VIEWS = 30
 
     // 爆发模式循环
     private val loop = object : Runnable {
         override fun run() {
             if (!isRunning) return
             // 每隔 10 到 15 秒触发一次爆发
-            val gap = Random.nextLong(35000, 50000)
+            val gap = Random.nextLong(100000, 130000)
             handler.postDelayed({
                 if (isRunning) {
                     burstMode()
@@ -57,7 +57,7 @@ class OverlayService : Service() {
     // 爆发模式：连续弹出 50 张
     private fun burstMode() {
         Log.d("Popper", "开始爆发弹窗！")
-        val count = 50
+        val count = 20
         for (i in 0 until count) {
             // 每次加一点微小延迟，减轻瞬间压力
             handler.postDelayed({

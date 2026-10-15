@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.PixelFormat
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.*
 import android.util.Log
@@ -35,36 +36,26 @@ class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private val handler = Handler(Looper.getMainLooper())
     private val activeViews = mutableListOf<View>()
-    
-    // 防止手机爆满卡死，设置屏幕上最多存在的图片数量
-    private val MAX_VIEWS = 30
+    private val backgroundViews = mutableListOf<View>() // 专门存放背景图，方便清理
+    private val prefs by lazy { getSharedPreferences("popper_settings", Context.MODE_PRIVATE) }
 
-    // 爆发模式循环
+    // 当前爆发状态
+    private var isBursting = false
+    private var burstEndTime = 0L
+    private var currentMediaPlayer: MediaPlayer? = null
+
+    private val MAX_VIEWS = 20 // 屏幕最多20张照片
+
     private val loop = object : Runnable {
         override fun run() {
             if (!isRunning) return
-            // 每隔 10 到 15 秒触发一次爆发
-            val gap = Random.nextLong(100000, 130000)
+            val gap = prefs.getInt("burst_interval", 30).toLong() * 1000L
             handler.postDelayed({
-                if (isRunning) {
-                    burstMode()
+                if (isRunning && !isBursting) {
+                    startBurst()
                 }
                 handler.postDelayed(this, gap)
             }, gap)
-        }
-    }
-
-    // 爆发模式：连续弹出 50 张
-    private fun burstMode() {
-        Log.d("Popper", "开始爆发弹窗！")
-        val count = 20
-        for (i in 0 until count) {
-            // 每次加一点微小延迟，减轻瞬间压力
-            handler.postDelayed({
-                if (isRunning) {
-                    try { spawnOne() } catch (e: Exception) { Log.e("Popper", "burst spawn", e) }
-                }
-            }, i * 30L) // 每张间隔 30 毫秒
         }
     }
 
@@ -90,6 +81,7 @@ class OverlayService : Service() {
     override fun onDestroy() {
         isRunning = false
         handler.removeCallbacks(loop)
+        stopAudio()
         removeAllViews()
         super.onDestroy()
     }
@@ -98,104 +90,225 @@ class OverlayService : Service() {
         if (isRunning) return
         isRunning = true
         startForegroundCompat()
-        // 立刻先爆发一次
-        burstMode()
-        // 然后开始 10~15 秒的循环
-        handler.postDelayed(loop, Random.nextLong(10000L, 15000L))
+        startBurst()
+        handler.postDelayed(loop, prefs.getInt("burst_interval", 30).toLong() * 1000L)
     }
 
     private fun stopPopping() {
         isRunning = false
         handler.removeCallbacks(loop)
+        stopAudio()
         removeAllViews()
         stopForegroundCompat()
         stopSelf()
     }
 
-    private fun startForegroundCompat() {
-        val notif = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val type = if (Build.VERSION.SDK_INT >= 34)
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
-            startForeground(NOTIF_ID, notif, type)
-        } else {
-            startForeground(NOTIF_ID, notif)
+    // ================== 爆发逻辑 ==================
+    private fun startBurst() {
+        if (!isRunning || isBursting) return
+        isBursting = true
+        val durationSec = prefs.getInt("burst_duration", 10)
+        burstEndTime = System.currentTimeMillis() + durationSec * 1000L
+
+        Log.d("Popper", "开始爆发弹窗！")
+        val count = prefs.getInt("burst_count", 15)
+
+        // 1. 添加右上角强制结束按钮（修复：现在真正显示出来了）
+        addForceStopView()
+
+        // 2. 添加背景图（从图片/视频素材中随机选一张）
+        val allAssets = AssetStore.load(this)
+        val mediaAssets = allAssets.filter { !it.isAudio }
+        if (mediaAssets.isNotEmpty()) {
+            val bgAsset = mediaAssets.random()
+            addBackgroundView(bgAsset)
+        }
+
+        // 3. 播放音频（从音频素材中随机选一个）
+        val audioAssets = allAssets.filter { it.isAudio }
+        if (audioAssets.isNotEmpty()) {
+            playRandomAudio(audioAssets)
+        }
+
+        // 4. 弹出照片
+        for (i in 0 until count) {
+            handler.postDelayed({
+                if (isRunning && isBursting) {
+                    try { spawnOne() } catch (e: Exception) { Log.e("Popper", "burst spawn", e) }
+                }
+            }, i * 30L)
+        }
+
+        // 5. 检查爆发是否结束
+        handler.postDelayed({
+            if (System.currentTimeMillis() >= burstEndTime) {
+                endBurst()
+            }
+        }, durationSec * 1000L + 1000L)
+    }
+
+    private fun endBurst() {
+        isBursting = false
+        stopAudio()
+        removeBackgroundView() // 清理背景图
+        removeForceStopView()  // 清理长按按钮
+        Log.d("Popper", "爆发结束")
+    }
+
+    // 添加背景
+    private fun addBackgroundView(a: PopItem) {
+        val dm = resources.displayMetrics
+        val vw = dm.widthPixels
+        val vh = dm.heightPixels
+
+        val iv = ImageView(this)
+        iv.scaleType = ImageView.ScaleType.CENTER_CROP
+        Glide.with(this).load(Uri.parse(a.uri)).into(iv)
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        val lp = WindowManager.LayoutParams(
+            vw, vh, type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0; y = 0
+        }
+
+        try { 
+            wm.addView(iv, lp)
+            backgroundViews.add(iv) // 修复：记录到列表里
+        } catch (e: Exception) { 
+            Log.e("Popper", "addBackground failed", e) 
         }
     }
 
-    private fun stopForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-        } else {
-            @Suppress("DEPRECATION") stopForeground(true)
+    // 移除背景
+    private fun removeBackgroundView() {
+        val copy = ArrayList(backgroundViews)
+        backgroundViews.clear()
+        copy.forEach {
+            try { wm.removeView(it) } catch (_: Exception) {}
         }
     }
 
-    private fun buildNotification(): Notification {
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-        }
-        val pi = PendingIntent.getActivity(
-            this, 0, openIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("随机弹图器运行中")
-            .setContentText("照片/视频正在爆发弹出")
-            .setSmallIcon(android.R.drawable.ic_menu_gallery)
-            .setContentIntent(pi)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-    }
+    // 右上角强制结束按钮（修复：现在能真正显示并响应长按）
+    private var forceStopView: View? = null
 
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
-                nm.createNotificationChannel(
-                    NotificationChannel(
-                        CHANNEL_ID, "弹图器",
-                        NotificationManager.IMPORTANCE_LOW
-                    ).apply { setShowBadge(false) }
-                )
+    private fun addForceStopView() {
+        if (forceStopView != null) return
+        val size = (resources.displayMetrics.density * 60).toInt()
+        val iv = ImageView(this).apply {
+            setBackgroundColor(0x33FF0000) // 半透明红色，方便定位
+            setOnLongClickListener {
+                if (isBursting) {
+                    endBurst()
+                    removeAllViews() // 清空所有照片和背景
+                }
+                true
             }
         }
+        
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else
+            @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        val lp = WindowManager.LayoutParams(
+            size, size, type,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            x = 0; y = 0
+        }
+
+        try { 
+            wm.addView(iv, lp)
+            forceStopView = iv
+        } catch (_: Exception) {}
     }
 
+    private fun removeForceStopView() {
+        forceStopView?.let {
+            try { wm.removeView(it) } catch (_: Exception) {}
+        }
+        forceStopView = null
+    }
+
+    // 播放音频
+    private fun playRandomAudio(audioAssets: List<PopItem>) {
+        if (audioAssets.isEmpty()) return
+        try {
+            val a = audioAssets.random()
+            val mp = MediaPlayer()
+            mp.setDataSource(this, Uri.parse(a.uri))
+            mp.isLooping = false
+            mp.setOnCompletionListener {
+                // 播放完成后，自动随机播放另一个
+                if (isBursting) {
+                    playRandomAudio(audioAssets)
+                }
+            }
+            mp.prepare()
+            mp.start()
+            currentMediaPlayer = mp
+        } catch (e: Exception) {
+            Log.e("Popper", "playAudio failed", e)
+        }
+    }
+
+    private fun stopAudio() {
+        try {
+            currentMediaPlayer?.stop()
+            currentMediaPlayer?.release()
+        } catch (_: Exception) {}
+        currentMediaPlayer = null
+    }
+
+    // ================== 视图管理 ==================
     private fun removeAllViews() {
         val copy = ArrayList(activeViews)
         activeViews.clear()
         copy.forEach {
             try { wm.removeView(it) } catch (_: Exception) {}
         }
+        removeBackgroundView()
+        removeForceStopView()
     }
 
     private fun spawnOne() {
-        val assets = AssetStore.load(this)
-        if (assets.isEmpty()) return
-        // 限制屏幕上的窗口总数
+        if (!isRunning || !isBursting) return
+        
+        val allAssets = AssetStore.load(this)
+        val mediaAssets = allAssets.filter { !it.isAudio }
+        if (mediaAssets.isEmpty()) return
+
+        // 限制屏幕上的窗口总数 (最多20张)
         if (activeViews.size >= MAX_VIEWS) {
             val oldest = activeViews.removeAt(0)
             try { wm.removeView(oldest) } catch (_: Exception) {}
         }
 
-        val a = assets.random()
-
+        val a = mediaAssets.random()
         val dm = resources.displayMetrics
         val vw = dm.widthPixels
         val vh = dm.heightPixels
 
-        // 随机大小：1/8 到 1/4 屏幕面积
         val areaRatio  = Random.nextDouble(1.0 / 8.0, 1.0 / 4.0)
         val targetArea = areaRatio * vw * vh
-        val aspect = if (a.width > 0 && a.height > 0)
-            a.width.toDouble() / a.height else 16.0 / 9.0
+        val aspect = if (a.width > 0 && a.height > 0) a.width.toDouble() / a.height else 16.0 / 9.0
 
         var h = sqrt(targetArea / aspect)
         var w = h * aspect
-        w = min(w, vw * 0.92)
-        h = min(h, vh * 0.92)
+        w = min(w, vw * 0.92); h = min(h, vh * 0.92)
 
         val view: View
         var videoView: VideoView? = null
@@ -204,20 +317,13 @@ class OverlayService : Service() {
             val vv = VideoView(this)
             videoView = vv
             vv.setVideoURI(Uri.parse(a.uri))
-            vv.setOnPreparedListener { mp ->
-                mp.isLooping = false
-                mp.setVolume(0f, 0f)
-                vv.start()
-            }
+            vv.setOnPreparedListener { mp -> mp.isLooping = false; mp.setVolume(0f, 0f); vv.start() }
             vv.setOnErrorListener { _, _, _ -> true }
             view = vv
         } else {
             val iv = ImageView(this)
             iv.scaleType = ImageView.ScaleType.CENTER_CROP
-            // 使用 Glide 加载，支持 GIF
-            Glide.with(this)
-                .load(Uri.parse(a.uri))
-                .into(iv)
+            Glide.with(this).load(Uri.parse(a.uri)).into(iv)
             view = iv
         }
 
@@ -237,39 +343,20 @@ class OverlayService : Service() {
             y = (Random.nextDouble() * (vh - h).coerceAtLeast(1.0)).toInt()
         }
 
-        // ✅ 这里修正为透明度 100%（完全不透明）
-        view.alpha  = 1f
-        view.scaleX = 0.4f
-        view.scaleY = 0.4f
+        view.alpha = 1f
+        view.scaleX = 0.4f; view.scaleY = 0.4f
 
-        try {
-            wm.addView(view, lp)
-        } catch (e: Exception) {
-            Log.e("Popper", "addView failed", e)
-            return
-        }
+        try { wm.addView(view, lp) } catch (e: Exception) { Log.e("Popper", "addView failed", e); return }
         activeViews.add(view)
 
-        // 缩放进入动画（不改变透明度，保证100%清晰）
-        view.animate()
-            .scaleX(1f).scaleY(1f)
-            .setDuration(350)
-            .start()
+        view.animate().scaleX(1f).scaleY(1f).setDuration(350).start()
 
         // 点击事件：50% 消失，50% 消失并弹 3 张
         view.setOnClickListener {
             activeViews.remove(view)
-            try {
-                videoView?.stopPlayback()
-                wm.removeView(view)
-            } catch (_: Exception) {}
-
+            try { videoView?.stopPlayback(); wm.removeView(view) } catch (_: Exception) {}
             if (Random.nextBoolean()) {
-                repeat(3) {
-                    handler.postDelayed({
-                        if (isRunning) spawnOne()
-                    }, 50L * it)
-                }
+                repeat(3) { handler.postDelayed({ if (isRunning && isBursting) spawnOne() }, 50L * it) }
             }
         }
 
@@ -283,17 +370,47 @@ class OverlayService : Service() {
 
         handler.postDelayed({
             activeViews.remove(view)
-            // 退出动画（从100%不透明渐变为0%透明）
-            view.animate()
-                .alpha(0f).scaleX(0.7f).scaleY(0.7f)
-                .setDuration(500)
-                .withEndAction {
-                    try {
-                        videoView?.stopPlayback()
-                        wm.removeView(view)
-                    } catch (_: Exception) {}
-                }
-                .start()
+            view.animate().alpha(0f).scaleX(0.7f).scaleY(0.7f).setDuration(500).withEndAction {
+                try { videoView?.stopPlayback(); wm.removeView(view) } catch (_: Exception) {}
+            }.start()
         }, life)
+    }
+
+    // ================== 前台服务与通知 ==================
+    private fun startForegroundCompat() {
+        val notif = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+            startForeground(NOTIF_ID, notif, type)
+        } else {
+            startForeground(NOTIF_ID, notif)
+        }
+    }
+
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
+        else @Suppress("DEPRECATION") stopForeground(true)
+    }
+
+    private fun buildNotification(): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
+        val pi = PendingIntent.getActivity(this, 0, openIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("随机弹图器运行中")
+            .setContentText("照片/视频正在爆发弹出")
+            .setSmallIcon(android.R.drawable.ic_menu_gallery)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(NotificationManager::class.java)
+            if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+                nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "弹图器", NotificationManager.IMPORTANCE_LOW).apply { setShowBadge(false) })
+            }
+        }
     }
 }
